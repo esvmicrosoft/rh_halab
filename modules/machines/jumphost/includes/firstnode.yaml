@@ -1,0 +1,159 @@
+      ---
+      - name: Initialize DRBD
+        ansible.builtin.shell:
+          cmd:  "{{ item }}"
+          creates: "/root/hafiles/drbd-setup"
+        loop:
+        - "drbdadm new-current-uuid --clear-bitmap r0/0"
+        - "drbdadm primary --force r0"
+        - "mkfs.xfs /dev/drbd0"
+        - "mount /dev/drbd0 /data"
+        - "mkdir -p /data/www/htdocs"
+        - "mkdir -p /data/cgi-bin"
+        - "chown -R root:root /data"
+        - "chmod -R 0755 /data"
+        - "touch /root/hafiles/drbd-setup"
+
+      - name: Check if cgi-bin directory exists
+        ansible.builtin.stat:
+          path: "/data/cgi-bin"
+          register: stat_cgibin
+
+      - name: Setup the Web structure
+        ansible.builtin.copy:
+          dest: "/data/cgi-bin/hostname.sh"
+          owner: "root"
+          group: "root"
+          mode: '0755'
+          content: |
+            #!/bin/sh
+            echo "Content-Type: text/html"
+            echo ""
+            echo "<html><head><title>Shell CGI script</title></head><body>"
+            echo "<h1>Shell CGI script</h1>"
+            echo "<p>The current directory is: `pwd`</p>"
+            echo "<p>The current user is: `whoami`</p>"
+            echo "<p>The current date is: `date`</p>"
+            echo "<p>The current hostname is: `uname -n`</p>"
+            echo "</body></html>"
+        when: stat_cgibin.stat.exists
+
+      - name: Check if cgi-bin directory exists
+        ansible.builtin.stat:
+          path: "/root/hafiles/drbd-setup"
+        register: stat_drbdsetup
+
+      - name: Unmount /data filesystem during config session
+        ansible.builtin.shell:
+          cmd:  "{{ item }}"
+          creates: "/root/hafiles/drbd-finale"
+        loop:
+        - "umount /data"
+        - "drbdadm secondary r0"
+        - "rm -f /root/hafiles/drbd-setup"
+        - "touch /root/hafiles/drbd-finale"
+        when: stat_drbdsetup.stat.exists == true
+
+      handlers:
+        - name: load module
+          ansible.builtin.command: modprobe softdog
+
+      - name: Format sbd_device
+        ansible.builtin.shell:
+          cmd: "{{ item }}"
+          creates: /root/hafiles/sbd_device
+        loop:
+        - /usr/sbin/sbd -d /dev/disk/azure/scsi1/lun0 -1 60 -4 120 create > /root/hafiles/sbd_device
+        - touch /root/hafiles/sbd_device
+
+      - name: Confugure the HA cluster
+        ansible.builtin.shell:
+          cmd:  "{{ item }}"
+          creates: /root/hafiles/cluster_setup
+        loop:
+        - /usr/sbin/crm cluster init --nodes {{ machineslist }}  -s /dev/disk/azure/scsi1/lun0  --yes
+        - touch /root/hafiles/cluster_setup
+
+      - name: Confugure fence agent with a Managed Identity
+        ansible.builtin.shell:
+          cmd: "{{ item }}"
+          creates: /root/hafiles/fence_agent
+        loop:
+        - crm configure primitive rsc_st_azure stonith:fence_azure_arm params msi=true subscriptionId="{{ subscriptionid }}" resourceGroup="{{ resourcegroup }}" pcmk_monitor_retries=4 pcmk_action_limit=3 power_timeout=240 pcmk_reboot_timeout=900 op monitor interval=3600 timeout=120
+        - touch /root/hafiles/fence_agent
+
+      - name: Azure Events agent
+        ansible.builtin.shell:
+          cmd: "{{ item }}"
+          creates: /root/hafiles/rsc_azure-events
+        loop:
+        - crm configure primitive rsc_azure-events ocf:heartbeat:azure-events op monitor interval=10s
+        - touch /root/hafiles/rsc_azure-events
+
+      - name: Azure Events agent clone
+        ansible.builtin.shell:
+          cmd: "{{ item }}"
+          creates: /root/hafiles/fence_agents-events_cluster
+        loop:
+        - crm configure clone cln_azure-events rsc_azure-events
+        - touch /root/hafiles/fence_agents-events_cluster
+
+      - name: Configure the DRBD resources
+        ansible.builtin.shell:
+          cmd: "{{ item }}"
+          creates: /root/hafiles/drbd_resource
+        loop:
+        - crm configure primitive drbd_r0 ocf:linbit:drbd params drbd_resource="r0" op monitor interval="15" role="Master" op monitor interval="30" role="Slave"
+        - crm configure ms ms-drbd_r0 drbd_r0 meta master-max="1" master-node-max="1" clone-max="2" clone-node-max="1" notify="true" interleave="true"
+        - crm configure primitive fs_data ocf:heartbeat:Filesystem params device=/dev/drbd0 directory=/data fstype=xfs op monitor interval="10s"
+        - touch /root/hafiles/drbd_resource
+
+      - name: Configure Primitive IP address
+        ansible.builtin.shell:
+          cmd: "{{ item }}"
+          creates: /root/hafiles/ipaddress
+        loop:
+        - crm configure primitive vip_address IPaddr2 params ip={{ serviceip }} op monitor interval=10 timeout=20
+        - touch /root/hafiles/ipaddress
+
+      - name: Configure the Application service primitive
+        ansible.builtin.shell:
+          cmd: "{{ item }}"
+          creates: /root/hafiles/apache2.service
+        loop:
+        - crm configure primitive apache2_service systemd:apache2.service
+        - touch /root/hafiles/apache2.service
+
+      - name: Configure Resource Group
+        ansible.builtin.shell:
+          cmd: "{{ item }}"
+          creates: /root/hafiles/resource_group
+        loop:
+        - crm configure group apache_group fs_data vip_address apache2_service
+        - touch  /root/hafiles/resource_group
+
+      - name: Configure order constraint
+        ansible.builtin.shell:
+          cmd: "{{ item }}"
+          creates: /root/hafiles/order_constraint
+        loop:
+        - 'crm configure order o-fs_data-before_apache inf: ms-drbd_r0:promote apache_group:start'
+        - touch /root/hafiles/order_constraint
+
+      - name: Configure colocation constraint
+        ansible.builtin.shell:
+          cmd: "{{ item }}"
+          creates: /root/hafiles/colocation_constraint
+        loop:
+        - 'crm configure colocation col-apache_fs_on_drbd inf: apache_group ms-drbd_r0:Master'
+        - touch /root/hafiles/colocation_constraint
+
+      - name: Confugure stonith-timeout
+        ansible.builtin.shell:
+          cmd: "{{ item }}"
+          creates: /root/hafiles/fence_agent
+        loop:
+        - crm configure property stonith-timeout=900
+        - crm configure rsc_defaults resource-stickness="200"
+        - touch /root/hafiles/stonith_timeout
+
